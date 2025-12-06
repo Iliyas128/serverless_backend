@@ -99,15 +99,110 @@ app.get('/api/products/random', async (req, res) => {
   }
 });
 
+// Поиск товаров (ставим выше параметрических маршрутов)
+app.get('/api/products/search', async (req, res) => {
+  try {
+    const { db } = await connectToDatabase();
+    const collection = db.collection(COLLECTION_NAME);
+    const query = req.query.q;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 15;
+    const skip = (page - 1) * limit;
+
+    if (!query) {
+      return res.status(400).json({
+        success: false,
+        error: 'Параметр поиска отсутствует'
+      });
+    }
+
+    const searchRegex = new RegExp(query, 'i');
+    
+    const products = await collection.find({
+      $or: [
+        { short_title: searchRegex },
+        { full_title: searchRegex },
+        { description: searchRegex },
+        { tags: searchRegex },
+        { url: searchRegex },
+        { 'categories.name': searchRegex },
+        { 'categories.slug': searchRegex }
+      ]
+    })
+    .skip(skip)
+    .limit(limit)
+    .project({
+      _id: 1,
+      short_title: 1,
+      description: 1,
+      small_image: 1,
+      categories: 1,
+      url: 1
+    })
+    .toArray();
+
+    const enrichedProducts = products.map(enrichProductData);
+
+    const total = await collection.countDocuments({
+      $or: [
+        { short_title: searchRegex },
+        { full_title: searchRegex },
+        { description: searchRegex },
+        { tags: searchRegex },
+        { url: searchRegex },
+        { 'categories.name': searchRegex },
+        { 'categories.slug': searchRegex }
+      ]
+    });
+
+    res.json({
+      success: true,
+      count: enrichedProducts.length,
+      total,
+      page,
+      totalPages: Math.ceil(total / limit),
+      products: enrichedProducts
+    });
+
+  } catch (error) {
+    console.error('Error searching products:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка при поиске товаров'
+    });
+  }
+});
+
 // Получить товар по ID (для детальной страницы)
 app.get('/api/products/:id', async (req, res) => {
   try {
     const { db } = await connectToDatabase();
     const collection = db.collection(COLLECTION_NAME);
-    
-    const product = await collection.findOne({
-      _id: new ObjectId(req.params.id)
-    });
+
+    const id = req.params.id;
+    let product = null;
+
+    // Если это валидный ObjectId в hex-формате — пробуем по _id
+    const isHexObjectId = /^[a-fA-F0-9]{24}$/.test(id);
+    if (isHexObjectId) {
+      try {
+        product = await collection.findOne({ _id: new ObjectId(id) });
+      } catch {
+        product = null;
+      }
+    }
+
+    // Если не нашли или id не ObjectId — ищем по url/названию/тегам
+    if (!product) {
+      product = await collection.findOne({
+        $or: [
+          { url: { $regex: id, $options: 'i' } },
+          { short_title: { $regex: id, $options: 'i' } },
+          { full_title: { $regex: id, $options: 'i' } },
+          { tags: { $regex: id, $options: 'i' } },
+        ],
+      });
+    }
 
     if (!product) {
       return res.status(404).json({
@@ -283,7 +378,10 @@ app.get('/api/products/search', async (req, res) => {
         { short_title: searchRegex },
         { full_title: searchRegex },
         { description: searchRegex },
-        { tags: searchRegex }
+        { tags: searchRegex },
+        { url: searchRegex },
+        { 'categories.name': searchRegex },
+        { 'categories.slug': searchRegex }
       ]
     })
     .skip(skip)

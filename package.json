@@ -1,7 +1,7 @@
 {
-    "name": "snggroup-api",
+    "name": "supra-trade-api",
     "version": "1.0.0",
-    "description": "SNG Group API для каталога товаров",
+    "description": "SUPRA TRADE API для каталога товаров",
     "main": "api/index.js",
     "scripts": {
       "dev": "node api/index.js",
