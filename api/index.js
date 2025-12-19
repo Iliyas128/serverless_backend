@@ -73,13 +73,33 @@ function generateOtp(length = OTP_LENGTH) {
   return Math.floor(min + Math.random() * (max - min)).toString();
 }
 
-async function sendOtpEmail(code) {
+async function sendOtpEmail(code, requestingEmail) {
   const to = ADMIN_MASTER_EMAIL;
-  const subject = 'SUPRA TRADE Admin OTP';
-  const text = `Ваш код для входа/регистрации администратора: ${code}\nДействует ${OTP_EXP_MINUTES} минут.`;
+  const subject = `🔐 SUPRA TRADE: Запрос OTP кода от ${requestingEmail}`;
+  const text = `Попытка входа в админ-панель SUPRA TRADE\n\n📧 Email пользователя, запрашивающего доступ: ${requestingEmail}\n\n🔑 Код для входа: ${code}\n\n⏰ Код действителен ${OTP_EXP_MINUTES} минут.\n\nЕсли вы не запрашивали этот код, проигнорируйте это сообщение.`;
+  
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f5f5f5;">
+      <div style="background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+        <h2 style="color: #333; margin-top: 0;">🔐 Запрос доступа к админ-панели</h2>
+        <p style="color: #666; font-size: 16px;">Пользователь запрашивает доступ к админ-панели SUPRA TRADE:</p>
+        <div style="background-color: #f0f0f0; padding: 15px; border-radius: 5px; margin: 20px 0;">
+          <p style="margin: 0; font-size: 14px; color: #666;"><strong>📧 Email пользователя:</strong></p>
+          <p style="margin: 5px 0 0 0; font-size: 18px; color: #1a1a1a; font-weight: bold;">${requestingEmail}</p>
+        </div>
+        <div style="background-color: #e3f2fd; padding: 20px; border-radius: 5px; margin: 20px 0; text-align: center;">
+          <p style="margin: 0 0 10px 0; font-size: 14px; color: #666;"><strong>🔑 Код для входа:</strong></p>
+          <p style="margin: 0; font-size: 32px; color: #1976d2; font-weight: bold; letter-spacing: 5px;">${code}</p>
+        </div>
+        <p style="color: #999; font-size: 12px; margin-top: 20px;">⏰ Код действителен ${OTP_EXP_MINUTES} минут.</p>
+        <p style="color: #999; font-size: 12px; margin-top: 10px;">Если вы не запрашивали этот код, проигнорируйте это сообщение.</p>
+      </div>
+    </div>
+  `;
 
   if (!mailerReady) {
-    console.log(`[DEV OTP] ${code} -> ${to}`);
+    console.log(`[DEV OTP] Код: ${code} -> ${to}`);
+    console.log(`[DEV OTP] Запросил доступ: ${requestingEmail}`);
     return;
   }
 
@@ -88,6 +108,7 @@ async function sendOtpEmail(code) {
     to,
     subject,
     text,
+    html,
   });
 }
 
@@ -275,7 +296,7 @@ app.post('/api/admin/request-otp', async (req, res) => {
       used: false,
     });
 
-    await sendOtpEmail(code);
+    await sendOtpEmail(code, email);
 
     return res.json({ success: true });
   } catch (error) {
@@ -288,16 +309,9 @@ app.post('/api/admin/verify-otp', async (req, res) => {
   try {
     const email = (req.body?.email || '').trim().toLowerCase();
     const code = (req.body?.code || '').trim();
-    const password = req.body?.password;
 
-    if (!email || !code || !password) {
-      return res.status(400).json({ success: false, error: 'Email, код и пароль обязательны' });
-    }
-
-    try {
-      await ensurePasswordValid(password);
-    } catch (err) {
-      return res.status(400).json({ success: false, error: err.message });
+    if (!email || !code) {
+      return res.status(400).json({ success: false, error: 'Email и код обязательны' });
     }
 
     const { db } = await connectToDatabase();
@@ -320,23 +334,18 @@ app.post('/api/admin/verify-otp', async (req, res) => {
     const adminUsers = db.collection(ADMIN_USERS_COLLECTION);
     const existing = await adminUsers.findOne({ email });
 
-    if (existing) {
-      const ok = await bcrypt.compare(password, existing.hashedPassword || '');
-      if (!ok) {
-        return res.status(401).json({ success: false, error: 'Неверный пароль' });
-      }
+    if (!existing) {
+      // Создаем нового пользователя без пароля
+      await adminUsers.insertOne({
+        email,
+        createdAt: now,
+        updatedAt: now,
+      });
+    } else {
       await adminUsers.updateOne(
         { _id: existing._id },
         { $set: { updatedAt: now } },
       );
-    } else {
-      const hashedPassword = await bcrypt.hash(password, 10);
-      await adminUsers.insertOne({
-        email,
-        hashedPassword,
-        createdAt: now,
-        updatedAt: now,
-      });
     }
 
     const expiresInSec = 60 * 60 * 24 * 7; // 7 дней
@@ -987,6 +996,44 @@ app.get('/api/products/:id', async (req, res) => {
       success: false,
       error: 'Ошибка при получении товара'
     });
+  }
+});
+
+// Инициализация категорий (можно вызвать один раз)
+app.post('/api/admin/init-categories', requireAdminAuth, async (req, res) => {
+  try {
+    const { db } = await connectToDatabase();
+    const categories = db.collection(CATEGORIES_COLLECTION);
+
+    const newCategories = [
+      { name: 'Электрика и автоматика', slug: 'elektrika-i-avtomatika', parentId: null, order: 0 },
+      { name: 'Подшипники и механика', slug: 'podshipniki-i-mehanika', parentId: null, order: 0 },
+      { name: 'Полимерные материалы', slug: 'polimernye-materialy', parentId: null, order: 0 },
+    ];
+
+    const now = new Date();
+    const results = [];
+
+    for (const cat of newCategories) {
+      // Проверяем, существует ли уже категория с таким slug
+      const existing = await categories.findOne({ slug: cat.slug, parentId: cat.parentId });
+      if (!existing) {
+        const doc = {
+          ...cat,
+          createdAt: now,
+          updatedAt: now,
+        };
+        const result = await categories.insertOne(doc);
+        results.push({ name: cat.name, inserted: true, id: result.insertedId });
+      } else {
+        results.push({ name: cat.name, inserted: false, message: 'Уже существует' });
+      }
+    }
+
+    res.json({ success: true, results });
+  } catch (error) {
+    console.error('Error initializing categories:', error);
+    res.status(500).json({ success: false, error: 'Ошибка при инициализации категорий' });
   }
 });
 
