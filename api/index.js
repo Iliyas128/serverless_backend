@@ -48,6 +48,8 @@ const JWT_SECRET = process.env.JWT_SECRET || 'change-me';
 const OTP_EXP_MINUTES = parseInt(process.env.OTP_EXP_MINUTES || '10', 10);
 const OTP_LENGTH = parseInt(process.env.OTP_LENGTH || '6', 10);
 const PASSWORD_MIN_LEN = parseInt(process.env.ADMIN_PASSWORD_MIN_LEN || '6', 10);
+const SUPPORTED_LANGS = ['ru', 'en', 'zh'];
+const DEFAULT_LANG = 'ru';
 
 // Nodemailer
 let mailerReady = false;
@@ -192,6 +194,71 @@ function enrichProductData(product) {
     ...product,
     fullUrl: generateProductFullUrl(product)
   };
+}
+
+function getLangFromReq(req) {
+  const fromQuery = (req.query?.lang || '').toString().toLowerCase();
+  const fromHeader = (req.headers['accept-language'] || '').toString().toLowerCase().slice(0, 2);
+  const candidate = fromQuery || fromHeader;
+  return SUPPORTED_LANGS.includes(candidate) ? candidate : DEFAULT_LANG;
+}
+
+function localizeCategory(cat, lang) {
+  if (!cat) return cat;
+  const tr = cat.translations && cat.translations[lang];
+  return {
+    ...cat,
+    name: tr?.name || cat.name,
+  };
+}
+
+function localizeProduct(product, lang) {
+  if (!product) return product;
+  const tr = product.translations && product.translations[lang];
+  return enrichProductData({
+    ...product,
+    short_title: tr?.short_title || product.short_title,
+    full_title: tr?.full_title || product.full_title,
+    description: tr?.description || product.description,
+    tags: tr?.tags || product.tags,
+    characteristics: tr?.characteristics || product.characteristics,
+  });
+}
+
+function projectProductFields(extra = {}) {
+  return {
+    _id: 1,
+    short_title: 1,
+    full_title: 1,
+    description: 1,
+    small_image: 1,
+    big_images: 1,
+    categoryId: 1,
+    categoryPath: 1,
+    categoryFullSlug: 1,
+    tags: 1,
+    url: 1,
+    characteristics: 1,
+    translations: 1,
+    ...extra,
+  };
+}
+
+function sanitizeTranslations(input, allowedFields = []) {
+  if (!input || typeof input !== 'object') return undefined;
+  const result = {};
+  for (const lang of SUPPORTED_LANGS) {
+    const tr = input[lang];
+    if (tr && typeof tr === 'object') {
+      result[lang] = {};
+      for (const field of allowedFields) {
+        if (tr[field] !== undefined) {
+          result[lang][field] = tr[field];
+        }
+      }
+    }
+  }
+  return Object.keys(result).length ? result : undefined;
 }
 
 async function getCategoryById(db, id) {
@@ -373,6 +440,7 @@ app.post('/api/admin/categories', requireAdminAuth, async (req, res) => {
     const parentIdRaw = req.body?.parentId || null;
     const order = Number.isFinite(req.body?.order) ? req.body.order : 0;
     let slug = normalizeSlug(req.body?.slug || name);
+    const translations = sanitizeTranslations(req.body?.translations, ['name']);
 
     if (!name) {
       return res.status(400).json({ success: false, error: 'Название обязательно' });
@@ -392,6 +460,7 @@ app.post('/api/admin/categories', requireAdminAuth, async (req, res) => {
       parentId,
       order,
       image: req.body?.image ? String(req.body.image).trim() : undefined,
+      translations,
       createdAt: now,
       updatedAt: now,
     };
@@ -452,6 +521,9 @@ app.patch('/api/admin/categories/:id', requireAdminAuth, async (req, res) => {
     }
     if (payload.image !== undefined) {
       updates.image = payload.image ? String(payload.image).trim() : undefined;
+    }
+    if (payload.translations !== undefined) {
+      updates.translations = sanitizeTranslations(payload.translations, ['name']);
     }
     if (payload.parentId !== undefined) {
       if (payload.parentId === null || payload.parentId === '') {
@@ -611,6 +683,7 @@ app.post('/api/admin/products', requireAdminAuth, async (req, res) => {
 
     const now = new Date();
     const productSlug = normalizeSlug(payload.url || payload.short_title || payload.full_title || 'product');
+    const translations = sanitizeTranslations(payload.translations, ['short_title', 'full_title', 'description', 'tags', 'characteristics']);
 
     const doc = {
       ...payload,
@@ -619,6 +692,7 @@ app.post('/api/admin/products', requireAdminAuth, async (req, res) => {
       categoryPath: categoryAttachment.categoryPath,
       categoryFullSlug: categoryAttachment.categoryFullSlug,
       categories: undefined, // убираем старый формат
+      translations,
       createdAt: now,
       updatedAt: now,
     };
@@ -643,6 +717,9 @@ app.patch('/api/admin/products/:id', requireAdminAuth, async (req, res) => {
 
     if (update.url) {
       update.url = normalizeSlug(update.url);
+    }
+    if (update.translations !== undefined) {
+      update.translations = sanitizeTranslations(update.translations, ['short_title', 'full_title', 'description', 'tags', 'characteristics']);
     }
 
     if (update.categoryId) {
@@ -700,26 +777,16 @@ app.delete('/api/admin/products/:id', requireAdminAuth, async (req, res) => {
 // Получить 15 случайных товаров (карточки)
 app.get('/api/products/random', async (req, res) => {
   try {
+    const lang = getLangFromReq(req);
     const { db } = await connectToDatabase();
     const collection = db.collection(COLLECTION_NAME);
 
     const randomProducts = await collection.aggregate([
       { $sample: { size: 15 } },
-      {
-        $project: {
-          _id: 1,
-          short_title: 1,
-          description: 1,
-          small_image: 1,
-          categoryId: 1,
-          categoryPath: 1,
-          categoryFullSlug: 1,
-          url: 1
-        }
-      }
+      { $project: projectProductFields({ full_title: 1 }) }
     ]).toArray();
 
-    const enrichedProducts = randomProducts.map(enrichProductData);
+    const enrichedProducts = randomProducts.map((p) => localizeProduct(p, lang));
 
     res.json({
       success: true,
@@ -739,6 +806,7 @@ app.get('/api/products/random', async (req, res) => {
 // Получить товары по пути категории (произвольная глубина)
 app.get('/api/products/category/*', async (req, res) => {
   try {
+    const lang = getLangFromReq(req);
     const { db } = await connectToDatabase();
     const collection = db.collection(COLLECTION_NAME);
     const page = parseInt(req.query.page) || 1;
@@ -792,6 +860,7 @@ app.get('/api/products/category/*', async (req, res) => {
 // Публичное дерево категорий
 app.get('/api/categories/tree', async (req, res) => {
   try {
+    const lang = getLangFromReq(req);
     const { db } = await connectToDatabase();
     const categories = await db
       .collection(CATEGORIES_COLLECTION)
@@ -799,7 +868,7 @@ app.get('/api/categories/tree', async (req, res) => {
       .sort({ order: 1, name: 1 })
       .toArray();
 
-    const tree = buildCategoriesTree(categories);
+    const tree = buildCategoriesTree(categories.map((c) => localizeCategory(c, lang)));
     res.json({ success: true, tree });
   } catch (error) {
     console.error('Error fetching category tree:', error);
@@ -813,6 +882,7 @@ app.get('/api/categories/tree', async (req, res) => {
 // Совместимость: /api/categories => дерево
 app.get('/api/categories', async (req, res) => {
   try {
+    const lang = getLangFromReq(req);
     const { db } = await connectToDatabase();
     const categories = await db
       .collection(CATEGORIES_COLLECTION)
@@ -820,7 +890,7 @@ app.get('/api/categories', async (req, res) => {
       .sort({ order: 1, name: 1 })
       .toArray();
 
-    const tree = buildCategoriesTree(categories);
+    const tree = buildCategoriesTree(categories.map((c) => localizeCategory(c, lang)));
     res.json({ success: true, tree });
   } catch (error) {
     console.error('Error fetching categories:', error);
@@ -834,6 +904,7 @@ app.get('/api/categories', async (req, res) => {
 // Поиск товаров
 app.get('/api/products/search', async (req, res) => {
   try {
+    const lang = getLangFromReq(req);
     const { db } = await connectToDatabase();
     const collection = db.collection(COLLECTION_NAME);
     const query = req.query.q;
@@ -866,19 +937,10 @@ app.get('/api/products/search', async (req, res) => {
     const products = await collection.find(filter)
     .skip(skip)
     .limit(limit)
-    .project({
-      _id: 1,
-      short_title: 1,
-      description: 1,
-      small_image: 1,
-      categoryId: 1,
-      categoryPath: 1,
-      categoryFullSlug: 1,
-      url: 1
-    })
+    .project(projectProductFields())
     .toArray();
 
-    const enrichedProducts = products.map(enrichProductData);
+    const enrichedProducts = products.map((p) => localizeProduct(p, lang));
 
     const total = await collection.countDocuments(filter);
 
@@ -903,6 +965,7 @@ app.get('/api/products/search', async (req, res) => {
 // Получить товар по полному URL (с категориями)
 app.get('/api/products/by-url/*', async (req, res) => {
   try {
+    const lang = getLangFromReq(req);
     const { db } = await connectToDatabase();
     const collection = db.collection(COLLECTION_NAME);
     
@@ -929,7 +992,7 @@ app.get('/api/products/by-url/*', async (req, res) => {
       });
     }
 
-    const enrichedProduct = enrichProductData(product);
+    const enrichedProduct = localizeProduct(product, lang);
 
     res.json({
       success: true,
@@ -948,6 +1011,7 @@ app.get('/api/products/by-url/*', async (req, res) => {
 // Получить товар по ID или slug (fallback)
 app.get('/api/products/:id', async (req, res) => {
   try {
+    const lang = getLangFromReq(req);
     const { db } = await connectToDatabase();
     const collection = db.collection(COLLECTION_NAME);
 
@@ -983,7 +1047,7 @@ app.get('/api/products/:id', async (req, res) => {
       });
     }
 
-    const enrichedProduct = enrichProductData(product);
+    const enrichedProduct = localizeProduct(product, lang);
 
     res.json({
       success: true,
