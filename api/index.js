@@ -225,6 +225,46 @@ function localizeProduct(product, lang) {
   });
 }
 
+// Локализуем вложенные категории в списке товаров, чтобы categoryPath/categories тоже имели переводы name
+async function localizeProductsWithCategories(db, products = [], lang) {
+  if (!products.length) return [];
+
+  const categoryIds = new Set();
+  products.forEach((p) => {
+    if (p?.categoryId) categoryIds.add(String(p.categoryId));
+    (p?.categoryPath || []).forEach((c) => c?._id && categoryIds.add(String(c._id)));
+    (p?.categories || []).forEach((c) => c?._id && categoryIds.add(String(c._id)));
+  });
+
+  let categoriesMap = new Map();
+  if (categoryIds.size) {
+    const docs = await db
+      .collection(CATEGORIES_COLLECTION)
+      .find({ _id: { $in: Array.from(categoryIds).map((id) => new ObjectId(id)) } })
+      .project({ name: 1, translations: 1 })
+      .toArray();
+    categoriesMap = new Map(docs.map((c) => [String(c._id), c]));
+  }
+
+  const localizeNode = (node) => {
+    if (!node) return node;
+    const doc = node._id ? categoriesMap.get(String(node._id)) : undefined;
+    const tr = doc?.translations?.[lang];
+    return { ...node, name: tr?.name || doc?.name || node.name };
+  };
+
+  return products.map((p) => {
+    const localized = localizeProduct(p, lang);
+    const basePath = Array.isArray(localized.categoryPath) ? localized.categoryPath : p.categoryPath;
+    const baseCategories = Array.isArray(localized.categories) ? localized.categories : p.categories;
+    return {
+      ...localized,
+      categoryPath: Array.isArray(basePath) ? basePath.map(localizeNode) : basePath,
+      categories: Array.isArray(baseCategories) ? baseCategories.map(localizeNode) : baseCategories,
+    };
+  });
+}
+
 function projectProductFields(extra = {}) {
   return {
     _id: 1,
@@ -786,7 +826,7 @@ app.get('/api/products/random', async (req, res) => {
       { $project: projectProductFields({ full_title: 1 }) }
     ]).toArray();
 
-    const enrichedProducts = randomProducts.map((p) => localizeProduct(p, lang));
+    const enrichedProducts = await localizeProductsWithCategories(db, randomProducts, lang);
 
     res.json({
       success: true,
@@ -826,16 +866,21 @@ app.get('/api/products/category/*', async (req, res) => {
     .project({
       _id: 1,
       short_title: 1,
+      full_title: 1,
       description: 1,
       small_image: 1,
-        categoryId: 1,
-        categoryPath: 1,
-        categoryFullSlug: 1,
+      big_images: 1,
+      tags: 1,
+      characteristics: 1,
+      translations: 1,
+      categoryId: 1,
+      categoryPath: 1,
+      categoryFullSlug: 1,
       url: 1
     })
     .toArray();
 
-    const enrichedProducts = products.map(enrichProductData);
+    const enrichedProducts = await localizeProductsWithCategories(db, products, lang);
 
     const total = await collection.countDocuments(filter);
 
@@ -940,7 +985,7 @@ app.get('/api/products/search', async (req, res) => {
     .project(projectProductFields())
     .toArray();
 
-    const enrichedProducts = products.map((p) => localizeProduct(p, lang));
+    const enrichedProducts = await localizeProductsWithCategories(db, products, lang);
 
     const total = await collection.countDocuments(filter);
 
@@ -992,7 +1037,7 @@ app.get('/api/products/by-url/*', async (req, res) => {
       });
     }
 
-    const enrichedProduct = localizeProduct(product, lang);
+    const [enrichedProduct] = await localizeProductsWithCategories(db, [product], lang);
 
     res.json({
       success: true,
@@ -1047,7 +1092,7 @@ app.get('/api/products/:id', async (req, res) => {
       });
     }
 
-    const enrichedProduct = localizeProduct(product, lang);
+    const [enrichedProduct] = await localizeProductsWithCategories(db, [product], lang);
 
     res.json({
       success: true,
